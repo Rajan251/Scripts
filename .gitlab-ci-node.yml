@@ -1,0 +1,172 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH != "main" && $CI_PIPELINE_SOURCE != "merge_request_event"      
+      when: never
+    - when: always
+
+variables:
+  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  DEV_SERVER_HOST: 35.180.46.122
+  DEV_ENDPOINT: http://ec2-35-180-46-122.eu-west-3.compute.amazonaws.com:3000
+  STAGING_SERVER_HOST: 35.180.46.122
+  STAGING_ENDPOINT: http://ec2-35-180-46-122.eu-west-3.compute.amazonaws.com:4000
+  PROD_SERVER_HOST: 35.180.46.122
+  PROD_ENDPOINT: http://ec2-35-180-46-122.eu-west-3.compute.amazonaws.com:5000
+
+stages:
+  - test
+  - build
+  - deploy_dev
+  - deploy_staging
+  - deploy_prod
+
+run_unit_tests:
+  image: node:17-alpine3.14
+  stage: test
+  cache:
+    key: "$CI_COMMIT_REF_NAME"
+    paths:
+      - app/node_modules
+  tags:
+    - ec2
+    - docker
+    - remote
+  before_script:
+    - cd app
+    - npm install
+  script:
+    - npm test
+  artifacts:
+    when: always
+    paths:
+      - app/junit.xml
+    reports:
+      junit: app/junit.xml
+
+sast:
+  stage: test
+
+build_image:
+  stage: build
+  tags:
+    - ec2
+    - shell
+    - remote
+  before_script:
+    - export PACKAGE_JSON_VERSION=$(cat app/package.json | jq -r .version)
+    - export VERSION=$PACKAGE_JSON_VERSION.$CI_PIPELINE_IID
+    - echo $VERSION > version-file.txt
+  script:
+    - docker build -t $IMAGE_NAME:$VERSION .
+  artifacts:
+    paths:
+      - version-file.txt
+
+
+push_image:
+  stage: build
+  dependencies:
+    - build_image
+  needs:
+    - build_image
+  tags:
+    - ec2
+    - shell
+    - remote
+  before_script:
+    - export VERSION=$(cat version-file.txt)
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker push $IMAGE_NAME:$VERSION
+
+.deploy:
+  tags: 
+    - ec2
+    - shell
+    - remote
+  dependencies:
+    - build_image
+  variables:
+    SSH_KEY: ""
+    SERVER_HOST: ""
+    DEPLOY_ENV: ""
+    APP_PORT: ""
+    ENDPOINT: ""
+  before_script:
+    - echo $SSH_KEY | sed -e "s/-----BEGIN RSA PRIVATE KEY-----/&\n/" -e "s/-----END RSA PRIVATE KEY-----/\n&/" -e "s/\S\{64\}/&\n/g"\ > deploy-key.pem
+    - chmod 400 deploy-key.pem
+    - export VERSION=$(cat version-file.txt)
+  script:
+    - scp -o StrictHostKeyChecking=no -i deploy-key.pem ./docker-compose.yaml ubuntu@$SERVER_HOST:/home/ubuntu
+    - ssh -o StrictHostKeyChecking=no -i deploy-key.pem ubuntu@$SERVER_HOST "
+        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY &&
+
+        export COMPOSE_PROJECT_NAME=$DEPLOY_ENV
+        export DC_IMAGE_NAME=$IMAGE_NAME && 
+        export DC_IMAGE_TAG=$VERSION &&
+        export DC_APP_PORT=$APP_PORT
+
+        docker-compose down &&
+        docker-compose up -d"
+  environment:
+    name: $DEPLOY_ENV
+    url: $ENDPOINT
+
+deploy_to_dev:
+  extends: .deploy
+  stage: deploy_dev
+  needs: 
+    - build_image
+  variables:
+    SSH_KEY: $SSH_PRIVATE_KEY
+    SERVER_HOST: $DEV_SERVER_HOST
+    DEPLOY_ENV: development
+    APP_PORT: 3000
+    ENDPOINT: $DEV_ENDPOINT
+
+
+run_functional_tests:
+  stage: deploy_dev
+  needs:
+    - deploy_to_dev
+  script:
+    - echo "running functional tests"
+
+deploy_to_staging:
+  extends: .deploy
+  stage: deploy_staging
+  needs: 
+    - build_image
+    - run_functional_tests
+  variables:
+    SSH_KEY: $SSH_PRIVATE_KEY
+    SERVER_HOST: $STAGING_SERVER_HOST
+    DEPLOY_ENV: staging
+    APP_PORT: 4000
+    ENDPOINT: $STAGING_ENDPOINT
+
+run_performance_tests:
+  stage: deploy_staging
+  needs:
+    - deploy_to_staging
+  script: 
+    - echo "Running performance tests"
+
+deploy_to_prod:
+  extends: .deploy
+  stage: deploy_prod
+  needs:
+    - build_image
+    - run_performance_tests
+  variables:
+    SSH_KEY: $SSH_PRIVATE_KEY
+    SERVER_HOST: $PROD_SERVER_HOST
+    DEPLOY_ENV: production
+    APP_PORT: 5000
+    ENDPOINT: $PROD_ENDPOINT
+  when: manual
+
+
+
+include:
+  - template: Jobs/SAST.gitlab-ci.yml

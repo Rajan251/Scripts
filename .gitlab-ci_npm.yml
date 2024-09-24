@@ -1,0 +1,78 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH != "main" && $CI_PIPELINE_SOURCE != "merge_request_event"      
+      when: never
+    - when: always
+
+variables:
+  IMAGE_NAME: $CI_REGISTRY_IMAGE/microservice/$MICRO_SERVICE
+  IMAGE_TAG: "1.0"
+  DEV_SERVER_HOST: 35.180.46.122
+
+stages:
+  - test
+  - build
+  - deploy
+  
+
+run_unit_tests:
+    image: node:17-alpine3.14
+    tags:
+      - ec2
+      - docker
+      - remote
+    before_script:
+     - cd app
+     - npm install
+    script:
+     - npm test
+    artifacts:
+     when: always
+     paths:
+      - app/junit.xml
+     reports:
+     junit: aap/junit.xml # these will uploaded to gitlab as an artifact
+
+build_docker_image:
+    stage: build
+    tags:
+     - ec2
+     - docker
+     - remote
+    script:
+    #  - docker build -t registry.gitlab.com/username/projectname:1.0 .
+     - docker build -t $CI_REGISTRY_IMAGE:1.0 # optimized way when we use same name in two different places we can 
+    #  - docker build -t $CI_REGISTRY_IMAGE/microservice/$MICRO_SERVICE:1.0
+
+push_image:
+    stage: build
+    tags:
+     - ec2
+     - docker
+     - remote
+    before_script:
+     - echo "Docker registry url is $CI_REGISTRY"
+     - echo "Docker registry url is $CI_REGISTRY_PASSWORD $CI_REGISTRY_USER"
+     - echo "Docker registry | is $CI_REGISTRY_USER"
+     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD registry.gitlab.com # $CI_REGISTRY we can use 
+    script:
+    #  - docker push registry.gitlab.com/username/projectname:1.0  # $CI_REGISTRY_IMAGE:1.0
+     - docker push $CI_REGISTRY_IMAGE/microservice/$MICRO_SERVICE:1.0 # $CI_REGISTRY_IMAGE/microservice/$MICRO_SERVICE:1.0
+
+
+deploy_to_dev:
+    stage: deploy 
+    tags:
+     - ec2
+     - shell
+     - remote
+    before_script:
+     - chmod 400 #$SSH_PRIVATE_KEY
+    script:
+    #  - kubectl apply -f deployment.yaml
+      - ssh -o StrictHostKeyChecking=no -i $SSH_PRIVATE_KEY ubuntu@35.180.46.122 
+      - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY && 
+        Docker run -d -p 3000:3000 $IMAGE_NAME:$IMAGE_TAG
+      
+      # - ssh -o -i $SSH_PRIVATE_KEY ubuntu@$SERVER_HOST
+      
